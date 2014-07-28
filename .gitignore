@@ -31,7 +31,9 @@ Thumbs.db
 
 bin/composer.phar
 bin/ocular.phar
+bin/box.phar
 coverage.clover
 bin/phpunit
 vendor/
 composer.lock
+wordpress.phar
