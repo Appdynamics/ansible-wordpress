@@ -1,0 +1,20 @@
+{
+    "name": "appdynamics/ansible-wordpress",
+    "type": "library",
+    "keywords": ["ansible", "wordpress"],
+    "description": "Ansible module for managing WordPress sites.",
+    "authors": [
+        {
+            "name": "Andrew Udvare",
+            "email": "audvare@gmail.com",
+            "homepage": "http://andrew.udvare.com"
+        }
+    ],
+    "config": {
+        "bin-dir": "bin"
+    },
+    "require": {
+        "php": ">=5.3.3",
+        "appdynamics/ansible-php": "dev-develop"
+    }
+}

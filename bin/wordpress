@@ -1,0 +1,724 @@
+#!/usr/bin/env php
+<?php
+// Testing:
+// cp ansible/library/wordpress ~/dev/corpsite-blog/ && ssh -i ~/.vagrant.d/insecure_private_key -p 2222 vagrant@thehost 'cd /opt/www/wordpress/blog && php wordpress args ; echo'
+// If you have json_pp, take off ` ; echo'` and pipe to it
+// function _require_ansible_php() {
+//     global $argv;
+//     $argFile = $argv[count($argv) - 1];
+//     $args = preg_split('/\s+/', file_get_contents($argFile), null, PREG_SPLIT_NO_EMPTY);
+//     foreach ($args as $i => $arg) {
+//         $spl = preg_split('/=/', $arg, 2);
+//         if (count($spl) !== 2) {
+//             continue; // Assume an argument with a space, but these do not need to be parsed here
+//         }
+//         $key = $spl[0];
+//         $val = $spl[1];
+//         if ($key === 'ansible_php') {
+//             require_once $val . '/vendor/autoload.php';
+//             return true;
+//         }
+//     }
+//     return false;
+// }
+// if (!_require_ansible_php() || !class_exists('AnsiblePhp\AnsibleModule')) {
+//     print json_encode(array('failed' => true, 'msg' => 'Failed to find AnsiblePhp library'));
+//     exit(1);
+// }
+require dirname(__FILE__).'/../vendor/autoload.php';
+
+use AnsiblePhp\AnsibleModule;
+
+function _find_plugin_by_name(AnsibleModule $module, $pluginName)
+{
+    static $plugins;
+    if (!$plugins) {
+        $plugins = get_plugins();
+    }
+
+    $phpFile = sprintf('%s.php', $pluginName);
+    $pluginFilename = null;
+
+    foreach ($plugins as $key => $pluginInfo) {
+        if ($key === $phpFile || dirname($key) === $pluginName) {
+            $pluginFilename = $key;
+            break;
+        }
+    }
+
+    if (!$pluginFilename) {
+        $module->failJson(array('msg' => sprintf('%s is not a valid plugin', $pluginName)));
+    }
+
+    return $pluginFilename;
+}
+
+/**
+ * Database patcher.
+ *
+ * Uses a normal PDO connection to avoid any weirdness with the `wpdb` class.
+ *   However, filters are still properly called for values on the `wp_options`
+ *   table.
+ */
+class WordPressDatabasePatcher {
+    /**
+     * Notice messages.
+     *
+     * @var array
+     */
+    public $notices;
+
+    /**
+     * Queries that run.
+     *
+     * @var array
+     */
+    public $queries;
+
+    /**
+     * Database connection.
+     *
+     * @var PDO
+     */
+    private $db;
+
+    /**
+     * Table names.
+     *
+     * @var array
+     */
+    private $tables = array();
+
+    /**
+     * Ansible module instance.
+     *
+     * @var AnsibleModule
+     */
+    private $module;
+
+    /**
+     * If testing (debug) mode is enabled.
+     *
+     * @var boolean
+     */
+    private $testing;
+
+    /**
+     * Constructor.
+     *
+     * @param AnsibleModule $module Ansible module instance.
+     */
+    public function __construct(AnsibleModule $module)
+    {
+        $this->module = $module;
+        $this->testing = $this->module->params['dry_run'];
+
+        $dsn = sprintf('mysql:dbname=%s;host=%s', DB_NAME, DB_HOST);
+        $this->db = new PDO($dsn, DB_USER, DB_PASSWORD, array(
+            PDO::MYSQL_ATTR_INIT_COMMAND => sprintf("SET NAMES '%s'", DB_CHARSET),
+        ));
+
+        $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $this->db->query('SET SESSION sql_warnings=1');
+        $this->db->query('SET SESSION sql_mode = "ANSI,TRADITIONAL"');
+
+        foreach ($this->db->query('SHOW TABLES') as $row) {
+            $this->tables[] = $row[0];
+        }
+        sort($this->tables);
+    }
+
+    /**
+     * Custom error handler for collecting notice messages (`E_NOTICE`).
+     *
+     * This is mostly used for collection of serialisation error messages.
+     *
+     * @param integer $errno Error number.
+     * @param string  $msg   Message.
+     * @param string  $file  File.
+     * @param integer $line  Line number.
+     */
+    private function noticeHandler($errno, $msg, $file, $line)
+    {
+        $this->notices[] = $msg;
+    }
+
+    /**
+     * Primary find/replace method.
+     *
+     * @param string $find    String to find.
+     * @param string $replace Replacement.
+     *
+     * @return array Array with three values: changed state (boolean), count
+     *   of changes (integer), messages (array of strings).
+     */
+    public function replace($find, $replace)
+    {
+        $messages = array();
+        $changed = null;
+        $changes = 0;
+        $noticeHandler = array($this, 'noticeHandler');
+
+        if (!$this->testing && !$this->db->beginTransaction()) {
+            throw new \PDOException('Unable to begin transaction');
+        }
+
+        foreach ($this->tables as $tableName) {
+            $line = '';
+            foreach ($this->db->query(sprintf('SHOW CREATE TABLE %s', $tableName)) as $row) {
+                $line = $row['Create Table'];
+            }
+            if (!$line) {
+                $this->module->failJson(array('msg' => sprintf('SHOW CREATE TABLE failed for %s', $tableName)));
+            }
+
+            $columns = explode("\n", $line);
+            list($primaryKeys, $whereFormat) = $this->findPrimaryKey($columns, $messages);
+
+            if (!$primaryKeys) {
+                $messages[] = sprintf('No primary key for table "%s". These are not supported yet.', $tableName);
+                continue;
+            }
+
+            foreach ($this->getColumnNames($line) as $column) {
+                if (!$this->isStringColumn($column)) {
+                    continue;
+                }
+
+                $matches = array();
+                $columnName = preg_match('/^(?:\s+)?"([^"]+)"/', $column, $matches);
+                $columnName = '`'.$matches[1].'`';
+
+                if (!$primaryKeys) {
+                    throw new \RuntimeException($tableName.': '.$column);
+                }
+
+                $primaryKeysStr = implode(',', $primaryKeys);
+                $isComposite = count($primaryKeys) !== 1;
+                $columns = sprintf('%s,%s', $primaryKeysStr, $columnName);
+
+
+                $sql = sprintf('SELECT %s FROM %s', $columns, $tableName);
+
+                if (!$isComposite) {
+                    $sql .= sprintf(' ORDER BY %s ASC', $primaryKeys[0]);
+                }
+
+                foreach ($this->db->query($sql) as $row) {
+                    $pk = $row[0];
+                    $item = $row[1];
+                    $isScalar = is_scalar($item);
+
+                    if (!$isScalar || strlen($item) === 0) {
+                        continue;
+                    }
+
+                    $origHash = sha1($item);
+                    $isOptionTable = $tableName === 'wp_options' && $columnName === 'option_value';
+
+                    if ($isOptionTable) {
+                        $item = get_option($item); // Correctly get the value
+                    }
+
+                    $base64Encoded = $serialized = false;
+
+                    // First check if this is base64 encoded
+                    // http://stackoverflow.com/a/5885097/374110
+                    $base64Encoded = (bool) preg_match('/^(?:[A-Za-z0-9+\/]{4})*(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?$/', $item);
+                    if ($base64Encoded) {
+                        $item = base64_decode($item, true);
+                    }
+
+                    // Check if the value is PHP serialised
+                    $serialized = is_serialized($item);
+                    if (is_serialized($item)) { // is_serialized() from WP
+                        $count = count($this->notices);
+
+                        set_error_handler($noticeHandler, E_NOTICE);
+                        $item = unserialize($item);
+                        restore_error_handler();
+
+                        // Skip over bad values
+                        if (count($this->notices) > $count) {
+                            continue;
+                        }
+                    }
+
+                    // Skip as soon as possible
+                    if (is_scalar($item) && strpos($item, $find) === false) {
+                        continue;
+                    }
+
+                    $newItem = $this->recursiveReplace($item, $find, $replace);
+
+                    if ($isOptionTable) {
+                        $newItem = maybe_serialize($newItem); // Correctly save the value for this table, but don't write
+                    }
+
+                    // In reverse from above
+                    // Do not possibly serialise twice for wp_options table
+                    if ($serialized && !$isOptionTable) {
+                        $newItem = serialize($newItem);
+                    }
+                    if ($base64Encoded) {
+                        $newItem = base64_encode($newItem);
+                    }
+
+                    $newHash = sha1($newItem);
+
+                    if (strncmp($origHash, $newHash, 40) !== 0) {
+                        $changed = true;
+                    }
+                    else {
+                        continue;
+                    }
+
+                    // FIXME Special case
+                    // All tables should have data truncated appropriately to the maximum length (parse the VARCHAR(x) part of the line)
+                    if ($tableName === 'wp_blc_instances' && $columnName === '`link_text`') {
+                        $newItem = substr($newItem, 0, 250);
+                    }
+
+                    if (!$isComposite) {
+                        $sqlArgs = array($tableName, $columnName, $this->db->quote($newItem), $pk);
+
+                        $sql = array(vsprintf('UPDATE `%s` SET %s=', array_slice($sqlArgs, 0, 2)));
+                        $sql[] = sprintf('%s', $sqlArgs[2]);
+                        $sql[] = sprintf($whereFormat, $sqlArgs[3]);
+                        $sql = join(' ', $sql);
+                    }
+                    else {
+                        $sqlArgs = array($tableName, $columnName, $newItem) + array_slice($row, -1);
+                        $sql = vsprintf('UPDATE `'.$tableName.'` SET %s=%s '.$whereFormat, array(
+                            $this->db->quote($newItem),
+                            array_slice($row, -1),
+                        ));
+                    }
+
+                    $this->queries[] = $sql;
+
+                    if ($this->testing) {
+                        continue;
+                    }
+
+                    $changes += $this->db->exec($sql);
+                }
+            }
+        }
+
+        if ($this->testing) {
+            $changed = false;
+            $changes = 0;
+        }
+        else {
+            if (!$this->db->commit()) {
+                $ret = $this->db->rollBack();
+                $this->module->failJson(array('msg' => 'Rolled back because transaction could not be committed (PDO#commit() returned false)', 'rollBack_retval' => $ret));
+            }
+        }
+
+        return array($changed, $changes, $messages);
+    }
+
+    /**
+     * Gets column lines from a `CREATE TABLE` statement. The `CREATE TABLE`
+     *   statement is expected to be split by new lines after each comma. This
+     *   is the default from using MySQL client with default settings.
+     *
+     * @param string $line Line to parse.
+     *
+     * @return array Column lines.
+     */
+    private function getColumnNames($line)
+    {
+        $columns = array();
+
+        foreach (explode("\n", $line) as $x) {
+            if (substr($x, 0, 3) !== '  "') {
+                continue;
+            }
+
+            $exploded = explode(' ', $x);
+            $columns[] = join(' ', array_slice($exploded, 2));
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Finds primary key from a set of column lines.
+     *
+     * @param array $columns   Column lines.
+     * @param array &$messages Message array reference.
+     */
+    private function findPrimaryKey(array $columns, array &$messages)
+    {
+        $primaryKeyLine = null;
+
+        foreach ($columns as $line) {
+            if (strpos($line, 'PRIMARY KEY')) {
+                $primaryKeyLine = $line;
+                break;
+            }
+        }
+
+        if (!$primaryKeyLine) {
+            return array(null, null);
+        }
+
+        $key = preg_replace('/^\s+PRIMARY KEY\s+\("/', '', $primaryKeyLine);
+        $key = preg_replace('/\,$/', '', $key);
+        $key = str_replace(array('(', ')', '"'), '', $key);
+        $isComposite = strpos($key, ',') !== false;
+        $whereFormat = sprintf('WHERE %s = ', $key).'%s';
+        $primaryKeys = array('`'.$key.'`');
+
+        if ($isComposite) {
+            $whereFormat = array();
+            $primaryKeys = array();
+            foreach (explode(',', $key) as $i => $k) {
+                $whereFormat[] = '`'.$k.'` = ?';
+                $primaryKeys[] = $k;
+            }
+            $whereFormat = 'WHERE '.join(' AND ', $whereFormat);
+        }
+
+        return array($primaryKeys, $whereFormat);
+    }
+
+    /**
+     * Checks to see if a column line is for a string/blob column.
+     *
+     * @param string $columnLine Column line.
+     *
+     * @return boolean If the string is a string/blob column.
+     */
+    private function isStringColumn($columnLine)
+    {
+        $columnLine = strtolower($columnLine);
+        $blobRegex = '/" (long|medium|tiny)?(blob|text)\b/';
+        $varRegex = '/" (var)?(char|binary)\(/';
+        $enumRegex = '/" (enum|set)\(/';
+
+        foreach (array($blobRegex, $varRegex, $enumRegex) as $regex) {
+            if (preg_match($regex, $columnLine)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Performs recursive replacement.
+     *
+     * @param mixed  $val         Any value, but is not very reliable with
+     *   classes.
+     * @param string $find        String to find.
+     * @param string $replacement Replacement string.
+     *
+     * @return mixed Value with replacements made.
+     */
+    private function recursiveReplace($val, $find, $replace)
+    {
+        if (is_scalar($val)) {
+            if (is_string($val) && strpos($val, $find) !== false) {
+                return str_replace($find, $replace, $val);
+            }
+            return $val;
+        }
+        // cannot modify __PHP_Incomplete_Class instances, because on re-serialisation data will be lost
+        // __PHP_Incomplete_Class is caused by not having the class in question loaded yet
+        if ($val === null || $val instanceof __PHP_Incomplete_Class) {
+            return $val;
+        }
+
+        $wasStdClass = false;
+        if (is_object($val) && get_class($val) === 'stdClass') {
+            $wasStdClass = true;
+            $val = json_decode(json_encode($val), true);
+        }
+
+        foreach ($val as $key => $value) {
+            $val[$key] = $this->recursiveReplace($value, $find, $replace);
+        }
+
+        if ($wasStdClass) {
+            $val = json_decode(json_encode($val, JSON_FORCE_OBJECT));
+        }
+
+        return $val;
+    }
+}
+
+$DOCUMENATION = <<<EOF
+---
+module: wordpress
+short_description: WordPress site management.
+description:
+  - The M(wordpress) module can activate/deactivate plugins, update the database, database patch (simple but very intricate string replacment), setting the host, and setting options. It does all of these actions idempotently.
+options:
+  work_dir:
+    required: true
+    description:
+      - Site where WordPress (index.php) site is.
+  host:
+    required: true
+    description:
+      - Host name.
+  path:
+    required: no
+    description:
+      - Path the site lives under.
+  updb:
+    required: no
+    description:
+      - Updates the database.
+  activate_plugins:
+    required: no
+    description:
+      - List of plugins to activate.
+  deactivate_plugins:
+    required: no
+    description:
+      - List of plugins to deactivate.
+  str_replace_find:
+    required: no
+    description:
+      - String to find in the database for replacement. Must be used with str_replace_replacement.
+  str_replace_replacement:
+    required: no
+    description:
+      - String replacement value for str_replace_find.
+  dry_run:
+    required: no
+    default: no
+    description:
+      - Show only queries for string replacement. Does not actually perform string replacement.
+  set_host:
+    required: no
+    default: null
+    description:
+      - Set host name for the blog (for migration to another domain, etc).
+  protocol:
+    required: no
+    default: http
+    description:
+      - Set protocol. Used to switch to https with set_host action.
+  option:
+    required: no
+    default: null
+    description:
+      - Key name of the option to set. Requires a value= value.
+  value:
+    required: no
+    description:
+      - Value for the option (used with option action).
+EOF;
+
+$EXAMPLES = <<<EOF
+# Change the blog host
+# This is usually not sufficient enough and requires a string replacement
+wordpress: work_dir=/opt/www/wordpress/blog
+           host=oldhost.com
+           set_host=newhost.com
+
+# Replace oldhost.com with newhost.com across entire database as much as possible
+wordpress: work_dir=/opt/www/wordpress/blog
+           host=oldhost.com
+           str_replace_find=oldhost.com
+           str_replace_replacement=newhost.com
+
+# Activate a plugin
+wordpress: work_dir=/opt/www/wordpress/blog
+           activate_plugins=wordpress-language
+
+# Update the database
+wordpress: work_dir=/opt/www/wordpress/blog
+           updb=yes
+
+# Set an option
+# Always use the to_json filter with complex values (hashes)
+wordpress: work_dir=/opt/www/wordpress/blog
+           option=some_key
+           value={{complex_value|to_json}}
+EOF;
+
+/**
+ * Main function.
+ */
+function main()
+{
+    $module = new AnsibleModule(array(
+        // Information
+        'work_dir' => array('type' => 'directory', 'required' => true),
+        'host' => array('required' => true),
+        'path' => array(),
+
+        // Actions
+        'updb' => array('type' => 'bool', 'default' => false),
+
+        // Plugins
+        'activate_plugins' => array('type' => 'list'),
+        'deactivate_plugins' => array('type' => 'list'),
+
+        // Global string replacement
+        'str_replace_find' => array(),
+        'str_replace_replacement' => array(),
+        'dry_run' => array('type' => 'bool', 'default' => false),
+
+        // Set the host, which can include the path such as /blog
+        'set_host' => array(),
+        'protocol' => array('default' => 'http'),
+
+        // Option setting
+        'option' => array(),
+        'value' => array(),
+    ));
+    $changed = false;
+    $data = array();
+
+    $wpDir = realpath($module->params['work_dir']);
+    define('ABSPATH', $wpDir.'/'); // Note the ending /
+    $_SERVER['HTTP_HOST'] = $module->params['host'];
+
+    $config = sprintf('%s/wp-config.php', $wpDir);
+    require $config;
+
+    if ($module->params['str_replace_find']) {
+        if (!is_string($module->params['str_replace_replacement'])) {
+            $module->failJson(array('msg' => 'Must have a string replacement argument (str_replace_replacement) for str_replace_find'));
+        }
+
+        $patcher = new WordPressDatabasePatcher($module);
+        list($changed, $changes, $messages) = $patcher->replace($module->params['str_replace_find'], $module->params['str_replace_replacement']);
+
+        if ($module->params['dry_run']) {
+            $data['queries'] = $patcher->queries;
+        }
+
+        $data['messages'] = $messages;
+        $data['notices'] = $patcher->notices;
+        $data['rows_affected'] = $changes;
+    }
+
+    if ($module->params['updb']) {
+        $inc = sprintf('%s/wp-admin/includes/upgrade.php', $wpDir);
+
+        require_once $inc;
+
+        $wpdb = $GLOBALS['wpdb'];
+        $wpDbVersion = $GLOBALS['wp_db_version'];
+        $newVersion = __get_option('db_version');
+
+        if ($wpDbVersion == $newVersion) {
+            $data['updb'] = 'Nothing to update';
+        }
+        else {
+            // Based on wp_upgrade() function
+            wp_cache_flush();
+            pre_schema_upgrade();
+            make_db_current_silent(); // Weird function as it stores to a result but it does not return it
+            upgrade_all();
+            if (is_multisite() && is_main_site()) {
+                upgrade_network();
+            }
+            wp_cache_flush();
+            if (is_multisite()) {
+                if ($wpdb->get_row("SELECT blog_id FROM {$wpdb->blog_versions} WHERE blog_id = '{$wpdb->blogid}'")) {
+                    $wpdb->query("UPDATE {$wpdb->blog_versions} SET db_version = '{$wp_db_version}' WHERE blog_id = '{$wpdb->blogid}'");
+                }
+                else {
+                    $wpdb->query("INSERT INTO {$wpdb->blog_versions} ( `blog_id` , `db_version` , `last_updated` ) VALUES ( '{$wpdb->blogid}', '{$wp_db_version}', NOW());");
+                }
+            }
+            do_action('wp_upgrade', $wpDbVersion, $newVersion);
+            $changed = true;
+            $data['updb'] = 'Database upgraded';
+        }
+    }
+
+    if ($module->params['activate_plugins']) {
+        $currentPlugins = get_option('active_plugins', array());
+
+        foreach ($module->params['activate_plugins'] as $pluginName) {
+            $pluginFilename = _find_plugin_by_name($module, $pluginName);
+            $data['activated'][] = $pluginName;
+
+            // Check if it's alraedy been activated
+            if (in_array($pluginFilename, $currentPlugins)) {
+                continue;
+            }
+
+            $changed = true;
+            activate_plugin($pluginFilename);
+        }
+    }
+    if ($module->params['deactivate_plugins']) {
+        $currentPlugins = get_option('active_plugins', array());
+
+        foreach ($module->params['deactivate_plugins'] as $pluginName) {
+            $pluginFilename = _find_plugin_by_name($module, $pluginName);
+            $data['deactivated'][] = $pluginName;
+
+            // Check if it's alraedy been deactivated
+            if (!in_array($pluginFilename, $currentPlugins)) {
+                continue;
+            }
+
+            $changed = true;
+            deactivate_plugins($pluginFilename, true);
+        }
+    }
+
+    if ($module->params['option']) {
+        if (!isset($module->params['value'])) {
+            $module->failJson(array('msg' => 'Value ("value" key) must be set when using option'));
+        }
+
+        $value = $module->params['value'];
+
+        if (strpos($value, '{') !== false || strpos($value, '[') !== false) {
+            $value = $module->decodeJson($value);
+        }
+
+        $changed = update_option($module->params['option'], $value);
+        $data['option'] = array($module->params['option'] => $value);
+    }
+
+    if ($module->params['set_host']) {
+        $host = preg_replace('#/$#', '', $module->params['set_host']);
+        $changes = 0;
+
+        $uri = sprintf('%s://%s', $module->params['protocol'], $host);
+        $uriWithSlash = $uri.'/';
+
+        $changes += (int) update_option('siteurl', $uriWithSlash);
+        $changes += (int) update_option('home', $uri);
+
+        $queries = array(
+            $wpdb->prepare('UPDATE wp_blogs SET domain=%s WHERE blog_id = 1', $host),
+            $wpdb->prepare('UPDATE wp_site SET domain=%s WHERE id = 1', $uri),
+            $wpdb->prepare('UPDATE wp_sitemeta SET meta_value=%s WHERE meta_key = %s', $uriWithSlash, 'siteurl'),
+            $wpdb->prepare('UPDATE wp_sitemeta SET meta_value=%s WHERE meta_key = %s', $host, 'source_domain'),
+        );
+        foreach ($queries as $query) {
+            $ret = $wpdb->query($query);
+            if ($ret === false) {
+                $module->failJson(array('msg' => 'Query failed to execute', 'query' => $query));
+            }
+            $changes += $ret;
+        }
+
+        $data['set_host_change_count'] = $changes;
+
+        // Do not overwrite a true value
+        $changed = $changed || $changes > 0;
+    }
+
+    $module->exitJson(array_merge($data, array('changed' => $changed)));
+}
+
+main();
+
+// kate: indent-width 4
