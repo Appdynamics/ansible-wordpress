@@ -1,3 +1,7 @@
+# Not so fast
+
+Wait for https://github.com/ansible/ansible/pull/6374 to get resolved completely.
+
 # Building
 
 ## Install Composer and dependencies
