@@ -1,0 +1,16 @@
+{
+    "files": [
+        "bin/wordpress",
+        "LICENSE"
+    ],
+    "finder": [
+        {
+            "name": "*.php",
+            "exclude": "Tests",
+            "in": "vendor"
+        }
+    ],
+    "output": "wordpress.phar",
+    "main": "bin/wordpress",
+    "stub": true
+}
